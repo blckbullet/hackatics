@@ -58,7 +58,7 @@ export function RegisterForm({ onToggleForm }: { onToggleForm: () => void }) {
           Crear Cuenta
         </h1>
         <p className="text-center text-gray-600 mb-8">
-          Regístrate para iniciar tu servicio social
+          Regístrate para iniciar 
         </p>
 
         {error && (

@@ -342,7 +342,7 @@ export function StudentDashboard() {
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
             <div>
               <h1 className="text-2xl font-bold text-gray-900">
-                Mi Servicio Social
+                Nis Formatos
               </h1>
               <p className="text-sm text-gray-600 mt-1">
                 {profile?.full_name} • {profile?.matricula}
