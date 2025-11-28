@@ -3,16 +3,15 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import io
 import json
-import datetime
 import os
+import hashlib  # <--- Necesario para calcular la huella digital de la imagen
+import datetime
 
 # --- Librerías PDF ---
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
-
-# --- Librerías Imagen (CORRECCIÓN DE ERROR) ---
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw # Fallback
 
 # --- Librerías Criptografía ---
 from cryptography.hazmat.primitives import hashes
@@ -29,181 +28,190 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. LÓGICA DE BASE DE DATOS DE FIRMAS ---
-def get_signature_image_from_db(user_id: str):
-    """
-    Busca la imagen en la carpeta 'signatures'.
-    Si no existe, genera una imagen PNG dinámica en memoria para evitar errores.
-    """
-    # 1. Intentar cargar el archivo físico
-    # Nota: Limpiamos el user_id para evitar Path Traversal attacks
-    safe_id = "".join([c for c in user_id if c.isalnum() or c in ('_','-')])
-    signature_path = os.path.join("signatures", f"{safe_id}.png")
-    
-    if os.path.exists(signature_path):
-        print(f"✅ Firma física encontrada: {signature_path}")
-        return ImageReader(signature_path)
-    
-    print(f"⚠️ Firma no encontrada para {safe_id}. Generando firma digital visual...")
-    
-    # 2. FALLBACK: Generar imagen PNG con Pillow (Solución al error BytesIO)
-    # Creamos una imagen transparente
-    width, height = 400, 100
-    img = Image.new('RGBA', (width, height), (255, 255, 255, 0))
-    d = ImageDraw.Draw(img)
-    
-    # Dibujamos un texto simulando la firma
-    # Usamos fuente por defecto si no hay una específica
-    try:
-        # Intentar dibujar un rectángulo azul y el nombre
-        d.rectangle([10, 10, width-10, height-10], outline="blue", width=3)
-        d.text((20, 40), f"Firma Digital: {user_id}", fill="darkblue")
-        d.text((20, 60), f"Validado por Sistema", fill="gray")
-    except Exception as e:
-        print(f"Error generando imagen: {e}")
+# Archivo de base de datos de confianza (Generado por registeruser.py)
+USERS_DB_FILE = "users_db.json"
 
-    # Guardar en buffer como PNG
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    buffer.seek(0)
-    
-    return ImageReader(buffer)
+# --- FUNCIONES DE SEGURIDAD ---
 
-# --- 2. ENDPOINT DE FIRMA SEGURA ---
+def get_user_metadata(user_id: str):
+    """Carga los datos del usuario (hash esperado) desde el JSON."""
+    if not os.path.exists(USERS_DB_FILE):
+        return None
+    with open(USERS_DB_FILE, 'r') as f:
+        db = json.load(f)
+    return db.get(user_id)
+
+def verify_image_integrity(image_path: str, expected_hash: str) -> bool:
+    """
+    Calcula el hash SHA256 del archivo en disco y lo compara con el esperado.
+    Retorna True si la imagen es auténtica.
+    """
+    if not os.path.exists(image_path):
+        return False
+        
+    sha256_hash = hashlib.sha256()
+    with open(image_path, "rb") as f:
+        # Leer el archivo en bloques para no saturar memoria
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    
+    calculated_hash = sha256_hash.hexdigest()
+    
+    print(f"🔍 Auditoría de Integridad:")
+    print(f"   - Hash Esperado (BD): {expected_hash}")
+    print(f"   - Hash Actual (Disco): {calculated_hash}")
+    
+    return calculated_hash == expected_hash
+
+# --- ENDPOINT SEGURO ---
 @app.post("/secure-sign-pdf")
 async def secure_sign_pdf(
-    file: UploadFile = File(...),          # PDF original
-    private_key: UploadFile = File(...),   # Llave privada (.pem)
-    password: str = Form(...),             # Contraseña de la llave
-    signatures: str = Form(...),           # Coordenadas JSON
-    user_id: str = Form(...)               # ID del usuario (ej: usuario_ejemplo_123)
+    file: UploadFile = File(...), 
+    private_key: UploadFile = File(...), 
+    password: str = Form(...), 
+    signatures: str = Form(...), 
+    user_id: str = Form(...) 
 ):
-    """
-    Flujo Completo:
-    1. Recibe credenciales y archivo.
-    2. Valida la identidad desencriptando la llave privada.
-    3. Busca la firma visual en la BD (carpeta).
-    4. Estampa la firma visual en el PDF.
-    5. Calcula Hash y firma criptográficamente el PDF.
-    6. Devuelve el PDF final.
-    """
     try:
-        # A. VALIDACIÓN DE IDENTIDAD (CRÍTICO)
+        print(f"🔒 Iniciando proceso de firma segura para: {user_id}")
+
+        # ---------------------------------------------------------
+        # PASO 1: VERIFICACIÓN DE IDENTIDAD (Llave Privada)
+        # ---------------------------------------------------------
         try:
             key_bytes = await private_key.read()
             private_key_obj = serialization.load_pem_private_key(
                 key_bytes,
                 password=password.encode(),
             )
-            print("✅ Identidad verificada correctamente con llave privada.")
+            print("✅ Paso 1: Llave Privada desbloqueada correctamente. Identidad verificada.")
         except ValueError:
-            print("❌ Contraseña incorrecta o llave corrupta.")
-            raise HTTPException(status_code=401, detail="Credenciales inválidas: Contraseña incorrecta.")
+            print("❌ Error: La contraseña de la llave es incorrecta.")
+            raise HTTPException(status_code=401, detail="FALLO DE AUTENTICACIÓN: Contraseña de llave incorrecta o llave inválida.")
 
-        # B. OBTENER IMAGEN VISUAL
-        signature_img = get_signature_image_from_db(user_id)
+        # ---------------------------------------------------------
+        # PASO 2: VERIFICACIÓN DE INTEGRIDAD DE IMAGEN (Anti-Tampering)
+        # ---------------------------------------------------------
+        # A. Buscar datos del usuario
+        user_data = get_user_metadata(user_id)
+        if not user_data:
+            # Si el usuario no está en el JSON, no podemos confiar en la firma
+            raise HTTPException(status_code=404, detail=f"Usuario {user_id} no registrado en la base de confianza.")
 
-        # C. PROCESAR PDF (Estampado Visual)
+        image_filename = user_data['image_filename']
+        expected_hash = user_data['image_hash']
+        
+        # B. Localizar el archivo físico
+        signature_path = os.path.join("signatures", image_filename)
+        
+        if not os.path.exists(signature_path):
+            raise HTTPException(status_code=500, detail="ERROR CRÍTICO: El archivo de firma original ha sido eliminado del servidor.")
+
+        # C. COMPARAR HASHES (Aquí detectamos si cambiaron la imagen)
+        if not verify_image_integrity(signature_path, expected_hash):
+            print("🚨 ALERTA DE SEGURIDAD: Los hashes no coinciden. Posible hackeo.")
+            raise HTTPException(status_code=403, detail="ALERTA DE FRAUDE: La imagen de su firma ha sido alterada en el servidor. El hash no coincide con el registro original.")
+        
+        print("✅ Paso 2: Integridad de la imagen verificada. La firma es auténtica.")
+        
+        # D. Cargar la imagen ya validada
+        signature_img = ImageReader(signature_path)
+
+        # ---------------------------------------------------------
+        # PASO 3: ESTAMPADO VISUAL EN EL PDF
+        # ---------------------------------------------------------
         input_pdf_bytes = await file.read()
-        input_stream = io.BytesIO(input_pdf_bytes)
-        input_pdf = PdfReader(input_stream)
+        input_pdf = PdfReader(io.BytesIO(input_pdf_bytes))
         writer = PdfWriter()
         
         sigs_data = json.loads(signatures)
-        
-        # Mapa de firmas por página
         sigs_by_page = {}
         for s in sigs_data:
             p = s.get('page', 1) - 1
             if p not in sigs_by_page: sigs_by_page[p] = []
             sigs_by_page[p].append(s)
 
-        # Iterar páginas y estampar
         for i, page in enumerate(input_pdf.pages):
             if i in sigs_by_page:
                 page_width = float(page.mediabox.width)
                 page_height = float(page.mediabox.height)
-                
                 packet = io.BytesIO()
                 c = canvas.Canvas(packet, pagesize=(page_width, page_height))
                 
                 for sig in sigs_by_page[i]:
-                    # Cálculos de posición
                     w = sig['width_percent'] * page_width
                     h = sig['height_percent'] * page_height
                     x = sig['x_percent'] * page_width
-                    y_top = sig['y_percent'] * page_height
-                    y = page_height - y_top - h
+                    y = page_height - (sig['y_percent'] * page_height) - h
                     
-                    # Dibujar imagen (mask='auto' respeta transparencia PNG)
-                    try:
-                        c.drawImage(signature_img, x, y, width=w, height=h, mask='auto', preserveAspectRatio=True)
-                    except Exception as img_err:
-                        print(f"Error dibujando imagen: {img_err}")
-                        # Fallback texto si la imagen falla
-                        c.drawString(x, y, f"[Firma: {user_id}]")
-
-                    # Hash visual de referencia
-                    c.setFont("Helvetica", 5)
+                    # Estampar imagen
+                    c.drawImage(signature_img, x, y, width=w, height=h, mask='auto', preserveAspectRatio=True)
+                    
+                    # Texto de validación visual con parte del Hash
+                    c.setFont("Helvetica", 4)
                     c.setFillColorRGB(0.5, 0.5, 0.5)
-                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    c.drawString(x, y - 6, f"Digitally Signed: {timestamp}")
+                    c.drawString(x, y - 5, f"Integrity Check: {expected_hash[:12]}...")
 
                 c.save()
                 packet.seek(0)
-                overlay = PdfReader(packet).pages[0]
-                page.merge_page(overlay)
-            
+                page.merge_page(PdfReader(packet).pages[0])
             writer.add_page(page)
 
-        # D. GENERAR PDF INTERMEDIO
         temp_buffer = io.BytesIO()
         writer.write(temp_buffer)
         pdf_final_bytes = temp_buffer.getvalue()
 
-        # E. FIRMA CRIPTOGRÁFICA (El HASH real)
-        # Firmamos los bytes del PDF final modificado
+        # ---------------------------------------------------------
+        # PASO 4: FIRMA CRIPTOGRÁFICA DEL DOCUMENTO
+        # ---------------------------------------------------------
+        # Usamos la llave privada para firmar el contenido binario del PDF modificado
         digital_signature = private_key_obj.sign(
             pdf_final_bytes,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
             hashes.SHA256()
         )
         
-        # F. AGREGAR METADATOS
+        # ---------------------------------------------------------
+        # PASO 5: METADATOS Y RESPUESTA
+        # ---------------------------------------------------------
         final_reader = PdfReader(io.BytesIO(pdf_final_bytes))
         final_writer = PdfWriter()
         final_writer.append_pages_from_reader(final_reader)
         
-        # Inyectamos la prueba criptográfica en el PDF
+        # Inyectamos evidencia forense en los metadatos
         final_writer.add_metadata({
-            '/Producer': 'Hackatics Secure Signer v1.0',
-            '/Title': 'Documento Firmado Oficialmente',
+            '/Producer': 'Hackatics Secure Signer',
             '/Signer-Identity': user_id,
-            '/Digital-Signature-SHA256': digital_signature.hex(),
-            '/Verification': 'Validated against database and private key'
+            '/Image-Integrity-Hash': expected_hash, 
+            '/Digital-Signature': digital_signature.hex()
         })
         
-        output_buffer = io.BytesIO()
-        final_writer.write(output_buffer)
-        output_buffer.seek(0)
+        output = io.BytesIO()
+        final_writer.write(output)
+        output.seek(0)
 
-        print("✅ Proceso completado exitosamente.")
+        print("✅ Documento firmado y sellado exitosamente.")
         return StreamingResponse(
-            output_buffer, 
+            output, 
             media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=documento_firmado_seguro.pdf"}
+            headers={"Content-Disposition": "attachment; filename=documento_validado.pdf"}
         )
 
     except Exception as e:
-        print(f"🔥 Error Crítico en Backend: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        print(f"🔥 Error en servidor: {str(e)}")
+        # Si ya es un HTTPException (como el 403 o 401), lo relanzamos tal cual
+        if isinstance(e, HTTPException): raise e
+        # Si es un error inesperado, lanzamos 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    # Crear carpeta si no existe
+    # Inicializar DB vacía si no existe para evitar crash
+    if not os.path.exists(USERS_DB_FILE):
+        with open(USERS_DB_FILE, 'w') as f: json.dump({}, f)
+        print(f"⚠️ {USERS_DB_FILE} no existía y fue creado vacío. Ejecuta 'registeruser.py' para registrar usuarios.")
+        
     if not os.path.exists("signatures"):
         os.makedirs("signatures")
+        
     uvicorn.run(app, host="0.0.0.0", port=8000)
