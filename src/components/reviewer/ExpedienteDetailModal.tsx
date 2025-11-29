@@ -183,7 +183,7 @@ export function ExpedienteDetailModal({ expediente, onClose, onUpdate }: Expedie
       onUpdate(); // This will trigger the parent to reload expedientes
     } catch (error) {
       console.error('Error updating document:', error);
-      alert('Error al actualizar el documento');
+      
     } finally {
       setProcessing(false);
     }

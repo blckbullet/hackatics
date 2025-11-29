@@ -110,11 +110,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (error) throw error;
   };
 
+  // ... resto del código ...
+
   const signOut = async () => {
-    const { error } = await supabase.auth.signOut();
-    if (error) throw error;
-    setProfile(null);
+    try {
+      // Intentamos cerrar sesión en el servidor de Supabase
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+    } catch (error) {
+      // Si falla (por ejemplo, si la sesión ya no existe), solo lo registramos 
+      // pero NO detenemos la ejecución. Queremos que el usuario salga de la app sí o sí.
+      console.warn("Aviso al cerrar sesión:", error);
+    } finally {
+      // SIEMPRE limpiamos el estado local para redirigir al Login
+      setProfile(null);
+      setUser(null);
+      setSession(null);
+    }
   };
+
+  // ... resto del código ...
 
   const value = {
     user,
